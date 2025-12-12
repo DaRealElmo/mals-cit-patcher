@@ -33,7 +33,7 @@ You can download Python here:
 
 ---
 
-3. **Open the unzipped folder**, then **open a terminal** in the folder containing `cit_patcher.py`.
+3. **Open the unzipped folder**, then right click in the empty area of the folder and **open a terminal** in the folder containing `cit_patcher.py`.
 
 <div style="padding-left: 40px;">
   <img src="assets/screenshots/3_Open.png" width="500">
@@ -68,7 +68,7 @@ python cit_patcher.py
 
 ---
 
-6. When asked for a **generated folder name**, type any name you want that reflects the pack.
+6. When asked for a **generated folder name**, type any name you want that reflects the pack. **Do not** use spaces in this name!
 
 <div style="padding-left: 40px;">
   <img src="assets/screenshots/6_Name.png" width="500">
