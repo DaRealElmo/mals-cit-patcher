@@ -8,6 +8,10 @@ Requires *no* mods to use! All patched resource packs should be vanilla friendly
 
 It merges item models, rewrites textures, and handles special fallbacks automatically.
 
+## Changes in this fork
+
+This fork updates the patcher for newer Minecraft/Fabric resource-pack behaviour. It fixes block and item texture namespace handling for Minecraft 1.21.11, preserves animated texture `.png.mcmeta` files, carries over OptiFine emissive texture settings, and adds support for simple texture-only CIT entries that do not define a custom model. For the lights, [https://www.curseforge.com/minecraft/mc-mods/lambdynamiclights]LambDynamicLights is needed for blocks to light in the item frame and also [https://www.curseforge.com/minecraft/mc-mods/continuity]Continuity to carry light from other blocks. If you install LambDynamicLights then Continuity isn't needed but still recommended. This fork is for poeple who were having issues with this resource pack in 1.21.11 I don't know if it works in later versions but feel free to test and I won't be keeping this up to date as I just did it for my sister.
+
 ## Requirements
 
 You must have **Python 3.8+** installed to run this script.

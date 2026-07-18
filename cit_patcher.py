@@ -199,6 +199,111 @@ def merge_item_json(item_json_path, case_when, case_model_path, fallback_model):
 # Model JSON texture rewriting
 # ---------------------------
 
+TEXTURE_ATLAS_ROOTS = {"block", "item"}
+TARGET_RESOURCE_PACK_FORMAT = 75
+
+def _strip_png_suffix(path):
+    return path[:-4] if path.lower().endswith(".png") else path
+
+def _normalise_texture_path(value):
+    v = value.strip().replace("\\", "/")
+    local = False
+    if v.startswith("./"):
+        local = True
+        v = v[2:]
+    return local, _strip_png_suffix(v)
+
+def _find_local_texture(src_folder, texture_path):
+    """Return the local texture name copied by this patcher, if it exists."""
+    path = _strip_png_suffix(texture_path).replace("\\", "/").lstrip("/")
+    candidates = [
+        Path(src_folder) / f"{path}.png",
+        Path(src_folder) / f"{Path(path).name}.png",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            if candidate.parent == Path(src_folder):
+                return candidate.stem
+            return str(candidate.relative_to(src_folder).with_suffix("")).replace("\\", "/")
+    return None
+
+def choose_texture_atlas(textures, src_folder):
+    for val in textures.values():
+        if not isinstance(val, str) or ":" in val or val.strip().startswith("#"):
+            continue
+        _, base = _normalise_texture_path(val)
+        root = base.split("/", 1)[0] if "/" in base else None
+        if root in TEXTURE_ATLAS_ROOTS:
+            return root
+    return "item"
+
+def rewrite_texture_value(value, src_folder, generated_folder_name, target_atlas):
+    if not isinstance(value, str):
+        return value
+
+    raw = value.strip()
+    if not raw or raw.startswith("#"):
+        return value
+
+    local, base = _normalise_texture_path(raw)
+    if ":" in base:
+        return value
+
+    root = base.split("/", 1)[0] if "/" in base else None
+    local_name = _find_local_texture(src_folder, base)
+
+    if local or local_name:
+        texture_name = local_name or base
+        if root in TEXTURE_ATLAS_ROOTS and "/" in texture_name:
+            texture_name = texture_name.split("/", 1)[1]
+        return f"{generated_folder_name}:{target_atlas}/{texture_name}"
+
+    if root in TEXTURE_ATLAS_ROOTS:
+        return f"minecraft:{base}"
+
+    if re.search(r"[A-Za-z_]", base):
+        return f"{generated_folder_name}:{target_atlas}/{base}"
+
+    return value
+
+def patch_pack_mcmeta(dest_root):
+    mcmeta_path = Path(dest_root) / "pack.mcmeta"
+    data = safe_load_json(mcmeta_path)
+    if not isinstance(data, dict):
+        data = {}
+
+    pack = data.setdefault("pack", {})
+    description = pack.get("description", "Patched CIT resource pack")
+    pack.clear()
+    pack.update({
+        "pack_format": TARGET_RESOURCE_PACK_FORMAT,
+        "min_format": [TARGET_RESOURCE_PACK_FORMAT, 0],
+        "max_format": TARGET_RESOURCE_PACK_FORMAT,
+        "description": f"{description}\nPatched for Minecraft 1.21.11"
+    })
+    write_json_pretty(mcmeta_path, data)
+    log(f"Updated pack.mcmeta for resource pack format {TARGET_RESOURCE_PACK_FORMAT}")
+
+def copy_texture_with_mcmeta(src_path, dest):
+    shutil.copy2(str(src_path), dest)
+    log(f"Copied PNG {src_path} -> {dest}")
+
+    src_mcmeta = Path(f"{src_path}.mcmeta")
+    if src_mcmeta.exists():
+        dest_mcmeta = Path(f"{dest}.mcmeta")
+        shutil.copy2(str(src_mcmeta), str(dest_mcmeta))
+        log(f"Copied PNG metadata {src_mcmeta} -> {dest_mcmeta}")
+
+def copy_emissive_properties(src_root, generated_asset_root):
+    src = Path(src_root) / "assets" / "minecraft" / "optifine" / "emissive.properties"
+    if not src.exists():
+        return
+
+    dest = Path(generated_asset_root) / "optifine" / "emissive.properties"
+    ensure_dir(dest.parent)
+    shutil.copy2(str(src), str(dest))
+    log(f"Copied emissive properties {src} -> {dest}")
+
 # Rewrite model JSON textures to use generated namespace
 def rewrite_model_textures_and_write(src_json_path, dest_json_path, generated_folder_name):
     try:
@@ -214,18 +319,10 @@ def rewrite_model_textures_and_write(src_json_path, dest_json_path, generated_fo
     # --- Rewrite textures ---
     if isinstance(data, dict) and "textures" in data and isinstance(data["textures"], dict):
         textures = data["textures"]
+        target_atlas = choose_texture_atlas(textures, Path(src_json_path).parent)
         for key, val in list(textures.items()):
-            if not isinstance(val, str):
-                continue
-            v = val.strip()
-            if v.startswith("./") or v.startswith(".\\"):
-                base = v[2:]
-            else:
-                base = v
-            if ":" in base or "/" in base:
-                continue
-            if re.search(r"[A-Za-z_]", base):
-                new_val = f"{generated_folder_name}:item/{base}"
+            new_val = rewrite_texture_value(val, Path(src_json_path).parent, generated_folder_name, target_atlas)
+            if new_val != val:
                 textures[key] = new_val
                 log(f"Rewrote texture '{val}' -> '{new_val}' in {src_json_path}")
 
@@ -428,6 +525,31 @@ FALLBACK_OVERRIDES["clock"] = {
     "property": "context_dimension"
 }
 
+HANDHELD_ITEM_SUFFIXES = (
+    "_sword", "_axe", "_pickaxe", "_shovel", "_hoe",
+    "_trident", "_mace"
+)
+
+def default_texture_model_parent(item_name):
+    if item_name == "bow" or item_name == "crossbow" or item_name.endswith(HANDHELD_ITEM_SUFFIXES):
+        return "minecraft:item/handheld"
+    return "minecraft:item/generated"
+
+def write_texture_only_model(dest_model_path, item_name, texture_field, generated_folder_name):
+    if os.path.exists(dest_model_path):
+        log(f"Skipping existing texture-only model {dest_model_path}")
+        return
+
+    texture_name = Path(texture_field.replace("\\", "/")).stem
+    model = {
+        "parent": default_texture_model_parent(item_name),
+        "textures": {
+            "layer0": f"{generated_folder_name}:item/{texture_name}"
+        }
+    }
+    write_json_pretty(dest_model_path, model)
+    log(f"Generated texture-only model {dest_model_path}")
+
 # Process files based on type
 def process_cit_file(src_path, dest_items_path, generated_asset_root, generated_folder_name, block_names):
     src_path = Path(src_path)
@@ -443,10 +565,15 @@ def process_cit_file(src_path, dest_items_path, generated_asset_root, generated_
         tokens = re.split(r'\s+', match_items_value.strip())
         # model field
         model_field = props.get("model") or props.get("Model") or props.get("model-file")
-        if not model_field:
-            log(f"No model= in {src_path}; skipping")
+        texture_field = props.get("texture") or props.get("Texture")
+        if not model_field and not texture_field:
+            log(f"No model= or texture= in {src_path}; skipping")
             return
-        model_name = Path(model_field).stem  # e.g., apple_0
+        resource_field = model_field if model_field else texture_field
+        if resource_field is None:
+            log(f"No model= or texture= in {src_path}; skipping")
+            return
+        model_name = Path(resource_field).stem  # e.g., apple_0
         prop_stem = src_path.stem
         for tok in tokens:
             if not tok:
@@ -474,17 +601,22 @@ def process_cit_file(src_path, dest_items_path, generated_asset_root, generated_
                 fallback = f"minecraft:item/{item_name}"
 
             item_json_path = os.path.join(dest_items_path, f"{item_name}.json")
+            if not model_field and texture_field:
+                dest_model_path = os.path.join(generated_asset_root, "models", "item", f"{model_name}.json")
+                write_texture_only_model(dest_model_path, item_name, texture_field, generated_folder_name)
+
             case_model_path = f"{generated_folder_name}:item/{model_name}"
             merge_item_json(item_json_path, case_when, case_model_path, fallback)
             log(f"Added/updated case '{case_when}' -> {case_model_path} to {item_json_path}")
 
     elif lower == ".png":
-        dest = os.path.join(generated_asset_root, "textures", "item", src_path.name)
-        if os.path.exists(dest):
-            log(f"Skipping existing texture {dest}")
-        else:
-            shutil.copy2(str(src_path), dest)
-            log(f"Copied PNG {src_path} -> {dest}")
+        for atlas in ("item", "block"):
+            dest = os.path.join(generated_asset_root, "textures", atlas, src_path.name)
+            if os.path.exists(dest):
+                log(f"Skipping existing texture {dest}")
+            else:
+                ensure_dir(os.path.dirname(dest))
+                copy_texture_with_mcmeta(src_path, dest)
 
     elif lower == ".json":
         # when copying model JSONs, rewrite textures if necessary
@@ -525,9 +657,12 @@ def process_pack(input_path, generated_folder_name, block_names):
     ensure_dir(items_dir)
     ensure_dir(generated_asset_root / "models" / "item")
     ensure_dir(generated_asset_root / "textures" / "item")
+    ensure_dir(generated_asset_root / "textures" / "block")
 
     # Copy root-level non-assets files/dirs
     copy_root_files(str(src_root), str(dest_root))
+    patch_pack_mcmeta(dest_root)
+    copy_emissive_properties(src_root, generated_asset_root)
 
     # Walk CIT source
     cit_dir = src_root / "assets" / "minecraft" / "optifine" / "cit"
