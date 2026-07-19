@@ -195,6 +195,101 @@ def merge_item_json(item_json_path, case_when, case_model_path, fallback_model):
     }
     write_json_pretty(item_json_path, new_obj)
 
+def item_model_atlas(model_definition):
+    """Return the atlas used by a vanilla fallback item-model definition."""
+    if isinstance(model_definition, str):
+        path = model_definition.split(":", 1)[-1]
+        return "block" if path.startswith("block/") else "item"
+    if isinstance(model_definition, dict):
+        for key in ("model", "base"):
+            value = model_definition.get(key)
+            if isinstance(value, str):
+                path = value.split(":", 1)[-1]
+                if path.startswith("block/"):
+                    return "block"
+        for value in model_definition.values():
+            if isinstance(value, (dict, list)) and item_model_atlas(value) == "block":
+                return "block"
+    elif isinstance(model_definition, list):
+        for value in model_definition:
+            if item_model_atlas(value) == "block":
+                return "block"
+    return "item"
+
+def normalise_item_case_atlases(dest_items_path, generated_asset_root, generated_folder_name):
+    """Keep every case in an item selector on the same atlas as its fallback."""
+    model_targets = {}
+    atlas_sources = {"item": set(), "block": set()}
+    for item_json_path in Path(dest_items_path).glob("*.json"):
+        data = safe_load_json(item_json_path)
+        model = data.get("model") if isinstance(data, dict) else None
+        if not isinstance(model, dict):
+            continue
+
+        target_atlas = item_model_atlas(model.get("fallback"))
+        for case in model.get("cases", []):
+            case_model = case.get("model") if isinstance(case, dict) else None
+            model_path = case_model.get("model") if isinstance(case_model, dict) else None
+            prefix = f"{generated_folder_name}:item/"
+            if not isinstance(model_path, str) or not model_path.startswith(prefix):
+                continue
+            model_name = model_path[len(prefix):]
+            model_targets.setdefault(model_name, set()).add(target_atlas)
+
+    for model_name, target_atlases in model_targets.items():
+        if len(target_atlases) != 1:
+            log(f"Model {model_name} is shared by item definitions using different atlases; leaving it unchanged")
+            continue
+
+        target_atlas = next(iter(target_atlases))
+        model_path = Path(generated_asset_root) / "models" / "item" / f"{model_name}.json"
+        data = safe_load_json(model_path)
+        textures = data.get("textures") if isinstance(data, dict) else None
+        if not isinstance(textures, dict):
+            continue
+
+        changed = False
+        for key, value in list(textures.items()):
+            if not isinstance(value, str) or ":" not in value:
+                continue
+            namespace, path = value.split(":", 1)
+            parts = path.split("/", 1)
+            if len(parts) != 2:
+                continue
+            atlas, texture_name = parts
+            if namespace == generated_folder_name and atlas in TEXTURE_ATLAS_ROOTS and atlas != target_atlas:
+                textures[key] = f"{namespace}:{target_atlas}/{texture_name}"
+                changed = True
+            elif namespace == "minecraft" and atlas in TEXTURE_ATLAS_ROOTS and atlas != target_atlas:
+                sprite = f"{generated_folder_name}:{target_atlas}/cit_patcher/{atlas}/{texture_name}"
+                atlas_sources[target_atlas].add((value, sprite))
+                textures[key] = sprite
+                changed = True
+
+        if changed:
+            write_json_pretty(model_path, data)
+            log(f"Normalised {model_name} textures to the {target_atlas} atlas")
+
+    assets_dir = Path(dest_items_path).parents[1]
+    for target_atlas, sources in atlas_sources.items():
+        if not sources:
+            continue
+        atlas_name = "items" if target_atlas == "item" else "blocks"
+        atlas_path = assets_dir / "minecraft" / "atlases" / f"{atlas_name}.json"
+        ensure_dir(atlas_path.parent)
+        atlas_data = {
+            "sources": [
+                {
+                    "type": "minecraft:single",
+                    "resource": resource,
+                    "sprite": sprite,
+                }
+                for resource, sprite in sorted(sources)
+            ]
+        }
+        write_json_pretty(atlas_path, atlas_data)
+        log(f"Added {len(sources)} texture aliases to {atlas_path}")
+
 # ---------------------------
 # Model JSON texture rewriting
 # ---------------------------
@@ -266,6 +361,52 @@ def rewrite_texture_value(value, src_folder, generated_folder_name, target_atlas
 
     return value
 
+def ensure_particle_texture(model_data):
+    """Give custom geometry a valid particle texture for modern model loading."""
+    if not isinstance(model_data, dict):
+        return
+
+    textures = model_data.get("textures")
+    if not isinstance(textures, dict) or "particle" in textures:
+        return
+
+    preferred_keys = ("all", "layer0", "0")
+    candidates = [textures.get(key) for key in preferred_keys]
+    candidates.extend(textures.values())
+    particle = next(
+        (value for value in candidates
+         if isinstance(value, str) and value and not value.startswith("#")),
+        None,
+    )
+    if particle:
+        textures["particle"] = particle
+
+def remove_unresolved_texture_faces(model_data):
+    """Treat legacy undefined texture references as intentionally hidden faces."""
+    if not isinstance(model_data, dict):
+        return
+
+    textures = model_data.get("textures")
+    texture_keys = set(textures) if isinstance(textures, dict) else set()
+    for element in model_data.get("elements", []):
+        if not isinstance(element, dict):
+            continue
+        faces = element.get("faces")
+        if not isinstance(faces, dict):
+            continue
+        for side, face in list(faces.items()):
+            if not isinstance(face, dict):
+                continue
+            texture = face.get("texture")
+            unresolved = (
+                not isinstance(texture, str)
+                or not texture
+                or texture.lower() == "null"
+                or (texture.startswith("#") and texture[1:] not in texture_keys)
+            )
+            if unresolved:
+                del faces[side]
+
 def patch_pack_mcmeta(dest_root):
     mcmeta_path = Path(dest_root) / "pack.mcmeta"
     data = safe_load_json(mcmeta_path)
@@ -325,6 +466,9 @@ def rewrite_model_textures_and_write(src_json_path, dest_json_path, generated_fo
             if new_val != val:
                 textures[key] = new_val
                 log(f"Rewrote texture '{val}' -> '{new_val}' in {src_json_path}")
+
+        ensure_particle_texture(data)
+        remove_unresolved_texture_faces(data)
 
     write_json_pretty(dest_json_path, data)
 
@@ -416,6 +560,19 @@ def resolve_model_parents(data, src_folder, visited=None):
 # Correct fallbacks for special items/blocks
 FALLBACK_OVERRIDES = {
     "cake": "minecraft:item/cake",  # standard item model (not block)
+
+    # "grass" was renamed to "short_grass" after this 1.20.1 CIT pack.
+    "short_grass": {
+        "type": "minecraft:model",
+        "model": "minecraft:item/short_grass",
+        "tints": [
+            {
+                "type": "minecraft:grass",
+                "downfall": 1.0,
+                "temperature": 0.5,
+            }
+        ],
+    },
 
     # Shields – special renderer
     "shield": {
@@ -530,6 +687,10 @@ HANDHELD_ITEM_SUFFIXES = (
     "_trident", "_mace"
 )
 
+ITEM_ID_ALIASES = {
+    "grass": "short_grass",
+}
+
 def default_texture_model_parent(item_name):
     if item_name == "bow" or item_name == "crossbow" or item_name.endswith(HANDHELD_ITEM_SUFFIXES):
         return "minecraft:item/handheld"
@@ -544,7 +705,8 @@ def write_texture_only_model(dest_model_path, item_name, texture_field, generate
     model = {
         "parent": default_texture_model_parent(item_name),
         "textures": {
-            "layer0": f"{generated_folder_name}:item/{texture_name}"
+            "layer0": f"{generated_folder_name}:item/{texture_name}",
+            "particle": f"{generated_folder_name}:item/{texture_name}",
         }
     }
     write_json_pretty(dest_model_path, model)
@@ -582,6 +744,11 @@ def process_cit_file(src_path, dest_items_path, generated_asset_root, generated_
                 ns, item_name = tok.split(':', 1)
             else:
                 ns, item_name = 'minecraft', tok
+
+            if ns == "minecraft" and item_name in ITEM_ID_ALIASES:
+                old_item_name = item_name
+                item_name = ITEM_ID_ALIASES[item_name]
+                log(f"Remapped item ID minecraft:{old_item_name} -> minecraft:{item_name}")
 
             # compute case_when now that we know the property stem AND the item_name
             case_when = transform_name_to_vanilla(prop_stem)
@@ -677,6 +844,8 @@ def process_pack(input_path, generated_folder_name, block_names):
         for f in files:
             src = Path(root) / f
             process_cit_file(str(src), str(items_dir), str(generated_asset_root), generated_folder_name, block_names)
+
+    normalise_item_case_atlases(items_dir, generated_asset_root, generated_folder_name)
 
     # If input was zip: pack back to zip and cleanup extracted folder and temporary dest folder
     if temp_dir:
